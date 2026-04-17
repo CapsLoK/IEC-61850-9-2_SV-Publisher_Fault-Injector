@@ -84,8 +84,11 @@ typedef struct {
     uint16_t cnt;     /* сохранённый SmpCnt                */
     uint64_t t;       /* время захвата (нс)                */
     int32_t  i1, i2, i3; /* значения токов                  */
-    Quality  q1, q2, q3; /* значения качества (Quality тип) */
+    uint32_t q1, q2, q3; /* значения качества (Quality тип) */
 } ReorderBuf_t;
+
+/* Глобальная переменная для нулевого значения Quality */
+static const Quality QUALITY_INVALID = 0;
 
 /* ============================================================
  * Помощник: безопасный парсинг uint16_t
@@ -108,6 +111,18 @@ static int parse_uint16_arg(const char* str, const char* arg_name, uint16_t* out
     }
     *out = (uint16_t)val;
     return 0;
+}
+
+/* ============================================================
+ * Инициализация буфера ReorderBuf_t
+ * ============================================================ */
+static void init_reorder_buf(ReorderBuf_t* rbuf) {
+    if (!rbuf) return;
+    rbuf->active = false;
+    rbuf->cnt = 0;
+    rbuf->t = 0;
+    rbuf->i1 = rbuf->i2 = rbuf->i3 = 0;
+    rbuf->q1 = rbuf->q2 = rbuf->q3 = 0;
 }
 
 /* ============================================================
@@ -360,7 +375,8 @@ int main(int argc, char** argv) {
     signal(SIGINT, sigint_handler);
 
     /* --- Буфер для REORDER --- */
-    ReorderBuf_t rbuf = {0};
+    ReorderBuf_t rbuf;
+    init_reorder_buf(&rbuf);
 
     /* --- Инициализация абсолютного времени --- */
     struct timespec next_time;
@@ -387,7 +403,7 @@ int main(int argc, char** argv) {
         int32_t v3 = v1 / 2;
 
         uint64_t now = get_time_ns();
-        Quality q = 0;  /* Quality тип из iec61850_common.h */
+        Quality q = QUALITY_INVALID;  /* Quality тип из iec61850_common.h */
         bool publish_now = true;
 
         /* 🔽 DROP — пропуск публикации */
