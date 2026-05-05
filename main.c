@@ -56,12 +56,16 @@ static inline int32_t get_sin_value(uint16_t idx) {
 
 /* ============================================================
  * POSIX fallback для времени, не зависит от HAL
+ * Используем CLOCK_TAI для совместимости с phc2sys/ptp4l
  * ============================================================ */
 static inline uint64_t get_time_ns(void) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        LOG_ERROR("clock_gettime failed: %s\n", strerror(errno));
-        return 0;
+    if (clock_gettime(CLOCK_TAI, &ts) != 0) {
+        /* Fallback на CLOCK_REALTIME если CLOCK_TAI недоступен */
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+            LOG_ERROR("clock_gettime failed: %s\n", strerror(errno));
+            return 0;
+        }
     }
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
@@ -378,20 +382,44 @@ int main(int argc, char** argv) {
     ReorderBuf_t rbuf;
     init_reorder_buf(&rbuf);
 
-    /* --- Инициализация абсолютного времени --- */
+    /* --- Инициализация абсолютного времени на основе CLOCK_TAI (PTP-время) --- */
     struct timespec next_time;
-    if (clock_gettime(CLOCK_MONOTONIC, &next_time) != 0) {
-        LOG_ERROR("clock_gettime failed: %s\n", strerror(errno));
-        SVPublisher_destroy(pub);
-        return EXIT_FAILURE;
+    int clock_source = CLOCK_TAI;
+    
+    /* Проверяем доступность CLOCK_TAI, fallback на CLOCK_REALTIME */
+    if (clock_gettime(CLOCK_TAI, &next_time) != 0) {
+        LOG_WARN("CLOCK_TAI недоступен, используем CLOCK_REALTIME\n");
+        clock_source = CLOCK_REALTIME;
+        if (clock_gettime(CLOCK_REALTIME, &next_time) != 0) {
+            LOG_ERROR("clock_gettime failed: %s\n", strerror(errno));
+            SVPublisher_destroy(pub);
+            return EXIT_FAILURE;
+        }
     }
-
-    uint16_t sample_idx = 0;
+    
+    /* Вычисляем время следующего сэмпла, привязываясь к началу секунды */
+    uint64_t now_ns = (uint64_t)next_time.tv_sec * 1000000000ULL + next_time.tv_nsec;
+    uint64_t sec_start_ns = (uint64_t)next_time.tv_sec * 1000000000ULL;
+    uint64_t next_sample_ns = sec_start_ns;
+    
+    /* Находим ближайший будущий интервал сэмпла */
+    while (next_sample_ns <= now_ns) {
+        next_sample_ns += INTERVAL_NS;
+    }
+    
+    next_time.tv_sec = next_sample_ns / 1000000000ULL;
+    next_time.tv_nsec = next_sample_ns % 1000000000ULL;
+    
+    /* Вычисляем начальный sample_idx на основе текущего времени */
+    uint64_t ns_since_sec_start = now_ns - sec_start_ns;
+    uint16_t sample_idx = (ns_since_sec_start / INTERVAL_NS) % SAMPLES_PER_SEC;
 
     /* ========================================================
      * Цикл публикации (REAL-TIME)
      * ======================================================== */
     LOG_INFO("Entering publish loop (REAL-TIME)...\n");
+    LOG_INFO("Clock source: %s, initial sample_idx=%u\n", 
+             clock_source == CLOCK_TAI ? "CLOCK_TAI" : "CLOCK_REALTIME", sample_idx);
     fflush(stdout);
 
     while (running) {
@@ -446,17 +474,33 @@ int main(int argc, char** argv) {
 
         /* ⏱️ Обновление абсолютного времени — предотвращает дрейф */
         sample_idx = (sample_idx + 1) % SAMPLES_PER_SEC;
-
-        next_time.tv_nsec += INTERVAL_NS;
-        while (next_time.tv_nsec >= 1000000000L) {
-            next_time.tv_sec++;
-            next_time.tv_nsec -= 1000000000L;
+        
+        /* Пересчитываем next_time от начала текущей секунды для защиты от дрейфа */
+        uint64_t current_sec = (uint64_t)next_time.tv_sec;
+        if (sample_idx == 0) {
+            /* При переходе через секунду корректируем время относительно PTP-времени */
+            struct timespec current_ptp;
+            if (clock_gettime(clock_source, &current_ptp) == 0) {
+                current_sec = (uint64_t)current_ptp.tv_sec;
+                /* Небольшая коррекция: следующий сэмпл должен быть в начале новой секунды */
+                next_time.tv_sec = current_sec;
+                next_time.tv_nsec = 0;
+            } else {
+                /* Fallback: просто инкремент секунды */
+                next_time.tv_sec++;
+                next_time.tv_nsec = 0;
+            }
+        } else {
+            /* Стандартный расчёт времени для остальных сэмплов */
+            uint64_t sample_offset_ns = (uint64_t)sample_idx * INTERVAL_NS;
+            next_time.tv_sec = current_sec + (sample_offset_ns / 1000000000ULL);
+            next_time.tv_nsec = sample_offset_ns % 1000000000ULL;
         }
 
         /* Обработка EINTR — повторный вызов при прерывании сигналом */
         int ret;
         do {
-            ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_time, NULL);
+            ret = clock_nanosleep(clock_source, TIMER_ABSTIME, &next_time, NULL);
         } while (ret == EINTR);
     }
 
