@@ -1,1 +1,19 @@
-Nothing needs to be added to .gitignore since only a source code file (`main.c`) was modified and there are no build artifacts, dependencies, or temporary files in the changes.
+```
+# Build artifacts
+build/
+CMakeCache.txt
+CMakeFiles/
+
+# Compiler outputs
+*.bin
+*.out
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+
+# Logs
+*.log
+```
