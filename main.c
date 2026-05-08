@@ -422,15 +422,25 @@ int main(int argc, char** argv) {
              clock_source == CLOCK_TAI ? "CLOCK_TAI" : "CLOCK_REALTIME", sample_idx);
     fflush(stdout);
 
+    /* Предварительно вычисляем значения для всех сэмплов на период вперёд */
+    int32_t v1_buf[SAMPLES_PER_PERIOD];
+    int32_t v2_buf[SAMPLES_PER_PERIOD];
+    int32_t v3_buf[SAMPLES_PER_PERIOD];
+    for (int i = 0; i < SAMPLES_PER_PERIOD; i++) {
+        v1_buf[i] = get_sin_value(i);
+        v2_buf[i] = -v1_buf[i];
+        v3_buf[i] = v1_buf[i] / 2;
+    }
+
     while (running) {
         uint16_t curr = sample_idx;
+        uint16_t period_idx = curr % SAMPLES_PER_PERIOD;
 
-        /* Значения из lookup table (вместо sin() в цикле) */
-        int32_t v1 = get_sin_value(curr);
-        int32_t v2 = -v1;
-        int32_t v3 = v1 / 2;
+        /* Значения из precomputed buffer (без вызовов в цикле) */
+        int32_t v1 = v1_buf[period_idx];
+        int32_t v2 = v2_buf[period_idx];
+        int32_t v3 = v3_buf[period_idx];
 
-        uint64_t now = get_time_ns();
         Quality q = QUALITY_INVALID;  /* Quality тип из iec61850_common.h */
         bool publish_now = true;
 
@@ -442,7 +452,9 @@ int main(int argc, char** argv) {
         else if (cfg.reorder_enabled && !rbuf.active && curr == cfg.reorder_delay) {
             rbuf.active       = true;
             rbuf.cnt          = curr;
-            rbuf.t            = now;
+            struct timespec ts_capture;
+            clock_gettime(clock_source, &ts_capture);
+            rbuf.t            = (uint64_t)ts_capture.tv_sec * 1000000000ULL + ts_capture.tv_nsec;
             rbuf.i1 = v1; rbuf.i2 = v2; rbuf.i3 = v3;
             rbuf.q1 = q; rbuf.q2 = q; rbuf.q3 = q;
             publish_now = false;
@@ -497,11 +509,30 @@ int main(int argc, char** argv) {
             next_time.tv_nsec = sample_offset_ns % 1000000000ULL;
         }
 
-        /* Обработка EINTR — повторный вызов при прерывании сигналом */
+        /* Обработка EINTR и просрочки времени — повторный вызов при прерывании сигналом */
         int ret;
         do {
             ret = clock_nanosleep(clock_source, TIMER_ABSTIME, &next_time, NULL);
+            /* Если время уже прошло (ret == 0 сразу), продолжаем цикл */
+            /* ETIMEDOUT не возвращается для TIMER_ABSTIME, но проверяем на всякий случай */
         } while (ret == EINTR);
+        
+        /* Если произошла серьёзная просрочка (> 500 мкс), синхронизируемся заново */
+        if (ret == 0) {
+            struct timespec actual_time;
+            clock_gettime(clock_source, &actual_time);
+            uint64_t actual_ns = (uint64_t)actual_time.tv_sec * 1000000000ULL + actual_time.tv_nsec;
+            uint64_t expected_ns = (uint64_t)next_time.tv_sec * 1000000000ULL + next_time.tv_nsec;
+            
+            /* Если отклонение больше 2 интервалов (500 мкс), корректируем базу */
+            if (actual_ns > expected_ns + 500000ULL) {
+                /* Синхронизация: следующий сэмпл должен быть через 1 интервал от текущего времени */
+                uint64_t new_next_ns = actual_ns + INTERVAL_NS;
+                next_time.tv_sec = new_next_ns / 1000000000ULL;
+                next_time.tv_nsec = new_next_ns % 1000000000ULL;
+                sample_idx = ((new_next_ns / INTERVAL_NS) % SAMPLES_PER_SEC);
+            }
+        }
     }
 
     /* ========================================================
